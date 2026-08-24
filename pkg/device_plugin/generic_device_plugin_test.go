@@ -149,7 +149,7 @@ var _ = Describe("Generic Device", func() {
 		fileObj, err = os.Create(devicePath)
 		Expect(err).ToNot(HaveOccurred())
 		fileObj.Close()
-		basePath = workDir
+		pciBasePath = workDir
 
 		devs = append(devs, &pluginapi.Device{
 			ID:     pciAddress1,

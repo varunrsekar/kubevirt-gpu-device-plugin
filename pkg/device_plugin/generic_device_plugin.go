@@ -386,12 +386,12 @@ func (dpi *GenericDevicePlugin) Allocate(ctx context.Context, reqs *pluginapi.Al
 			}
 			requestedDeviceFound := false
 			for _, dev := range nvDev {
-				iommuGroup, err := readLink(basePath, dev.addr, "iommu_group")
+				iommuGroup, err := readLink(pciBasePath, dev.addr, "iommu_group")
 				if err != nil || iommuGroup != iommuId {
 					log.Println("IommuGroup has changed on the system ", dev.addr)
 					return nil, fmt.Errorf("invalid allocation request: unknown device: %s", dev.addr)
 				}
-				vendorID, err := readIDFromFile(basePath, dev.addr, "vendor")
+				vendorID, err := readIDFromFile(pciBasePath, dev.addr, "vendor")
 				if err != nil || vendorID != nvidiaVendorID {
 					log.Println("Vendor has changed on the system ", dev.addr)
 					return nil, fmt.Errorf("invalid allocation request: unknown device: %s", dev.addr)
@@ -401,7 +401,7 @@ func (dpi *GenericDevicePlugin) Allocate(ctx context.Context, reqs *pluginapi.Al
 					requestedDeviceFound = true
 				}
 				if iommufdSupported {
-					vfiodev, err := readVFIODev(basePath, dev.addr)
+					vfiodev, err := readVFIODev(pciBasePath, dev.addr)
 					if err != nil {
 						return nil, fmt.Errorf("could not determine iommufd device for device %s: %v", dev.addr, err)
 					}

@@ -115,7 +115,7 @@ func getFakeVgpuIDFromFile(basePath string, deviceAddress string, property strin
 	return "", errors.New("Incorrect operation")
 }
 
-func getFakeGpuIDforVpu(basePath string, deviceAddress string) (string, error) {
+func getFakeGpuIDforVgpu(pciBasePath string, vGpuBasePath string, deviceAddress string) (string, error) {
 	if deviceAddress == deviceAddress1 || deviceAddress == deviceAddress2 || deviceAddress == deviceAddress3 {
 		return "GpuId", nil
 	}
@@ -244,36 +244,112 @@ var _ = Describe("Device Plugin", func() {
 	})
 
 	Context("readGpuIDForVgpu() Tests", func() {
+		const (
+			gpuID   = "0000:01:00.0"
+			gpuVFID = "0000:01:00.1"
+			vgpuID  = "4db93ff3-1774-4384-8a79-7b217cbb9157"
+		)
+		var pciDevicesPath string
+		var mdevDevicesPath string
+		var sysDevicesPath string
+
 		BeforeEach(func() {
-			linkDir, err = os.MkdirTemp("", "dp-test")
+			pciDevicesPath, err = os.MkdirTemp("", "dp-pci-test")
+			Expect(err).ToNot(HaveOccurred())
+			mdevDevicesPath, err = os.MkdirTemp("", "dp-vgpu-test")
+			Expect(err).ToNot(HaveOccurred())
+			sysDevicesPath, err = os.MkdirTemp("", "dp-sys-devices-test")
 			Expect(err).ToNot(HaveOccurred())
 
-			err = os.Mkdir(linkDir+"/vfio-pci", 0755)
-			Expect(err).ToNot(HaveOccurred())
-
-			workDir, err = os.MkdirTemp("", "kubevirt-test")
-			Expect(err).ToNot(HaveOccurred())
-
-			err = os.Mkdir(workDir+"/1", 0755)
-			Expect(err).ToNot(HaveOccurred())
-
-			err = os.Symlink(linkDir+"/vfio-pci", filepath.Join(workDir, deviceAddress1, "driver"))
-			Expect(err).ToNot(HaveOccurred())
-
+			DeferCleanup(func() {
+				Expect(os.RemoveAll(pciDevicesPath)).To(Succeed())
+				Expect(os.RemoveAll(mdevDevicesPath)).To(Succeed())
+				Expect(os.RemoveAll(sysDevicesPath)).To(Succeed())
+			})
 		})
 
-		It("Read gpu id corresponding to Vgpu with out error", func() {
-			driverID, err := readGpuIDForVgpu(workDir, "1/driver")
-			Expect(err).To(BeNil())
-			Expect(driverID).To(Equal(filepath.Base(linkDir)))
+		It("reads the GPU ID for a non-SR-IOV vGPU", func() {
+			Expect(os.Mkdir(filepath.Join(pciDevicesPath, gpuID), 0755)).To(Succeed())
+			target := filepath.Join(sysDevicesPath, gpuID, vgpuID)
+			Expect(os.MkdirAll(target, 0755)).To(Succeed())
+			Expect(os.Symlink(target, filepath.Join(mdevDevicesPath, vgpuID))).To(Succeed())
+
+			actualGPU, err := readGpuIDForVgpuFunc(pciDevicesPath, mdevDevicesPath, vgpuID)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(actualGPU).To(Equal(gpuID))
 		})
 
-		It("Read gpu id from a missing location to throw error", func() {
-			gpuID, err := readGpuIDForVgpu(workDir, "1/error")
-			Expect(err).ShouldNot(BeNil())
-			Expect(gpuID).To(Equal(""))
+		It("reads the GPU ID for an SR-IOV vGPU", func() {
+			Expect(os.Mkdir(filepath.Join(pciDevicesPath, gpuID), 0755)).To(Succeed())
+			gpuVFPath := filepath.Join(pciDevicesPath, gpuVFID)
+			Expect(os.Mkdir(gpuVFPath, 0755)).To(Succeed())
+			Expect(os.Symlink(filepath.Join("..", gpuID), filepath.Join(gpuVFPath, "physfn"))).To(Succeed())
+
+			target := filepath.Join(sysDevicesPath, gpuID, gpuVFID, vgpuID)
+			Expect(os.MkdirAll(target, 0755)).To(Succeed())
+			Expect(os.Symlink(target, filepath.Join(mdevDevicesPath, vgpuID))).To(Succeed())
+
+			actualGPU, err := readGpuIDForVgpuFunc(pciDevicesPath, mdevDevicesPath, vgpuID)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(actualGPU).To(Equal(gpuID))
 		})
 
+		It("returns an error when the vGPU symlink is missing", func() {
+			actualGPU, err := readGpuIDForVgpuFunc(pciDevicesPath, mdevDevicesPath, vgpuID)
+			Expect(err).To(HaveOccurred())
+			Expect(actualGPU).To(BeEmpty())
+		})
+
+		It("rejects a symlink for a different vGPU", func() {
+			target := filepath.Join(sysDevicesPath, gpuID, "different-vgpu")
+			Expect(os.Symlink(target, filepath.Join(mdevDevicesPath, vgpuID))).To(Succeed())
+
+			actualGPU, err := readGpuIDForVgpuFunc(pciDevicesPath, mdevDevicesPath, vgpuID)
+			Expect(err).To(MatchError(ContainSubstring("does not match the device address")))
+			Expect(actualGPU).To(BeEmpty())
+		})
+
+		It("rejects a symlink without a GPU parent directory", func() {
+			Expect(os.Symlink(vgpuID, filepath.Join(mdevDevicesPath, vgpuID))).To(Succeed())
+
+			actualGPU, err := readGpuIDForVgpuFunc(pciDevicesPath, mdevDevicesPath, vgpuID)
+			Expect(err).To(MatchError(ContainSubstring("symlink cannot be in the same directory")))
+			Expect(actualGPU).To(BeEmpty())
+		})
+
+		It("rejects a relative symlink without a PCI device path", func() {
+			target := filepath.Join(gpuID, vgpuID)
+			Expect(os.Symlink(target, filepath.Join(mdevDevicesPath, vgpuID))).To(Succeed())
+
+			actualGPU, err := readGpuIDForVgpuFunc(pciDevicesPath, mdevDevicesPath, vgpuID)
+			Expect(err).To(MatchError(ContainSubstring("not symlinked to a valid GPU VF sysfs path")))
+			Expect(actualGPU).To(BeEmpty())
+		})
+
+		It("rejects a vGPU whose parent is not a PCI device", func() {
+			target := filepath.Join(sysDevicesPath, gpuVFID, vgpuID)
+			Expect(os.MkdirAll(target, 0755)).To(Succeed())
+			Expect(os.Symlink(target, filepath.Join(mdevDevicesPath, vgpuID))).To(Succeed())
+
+			actualGPU, err := readGpuIDForVgpuFunc(pciDevicesPath, mdevDevicesPath, vgpuID)
+			Expect(err).To(MatchError(ContainSubstring("failed to verify sysfs path for GPU VF device")))
+			Expect(actualGPU).To(BeEmpty())
+		})
+
+		It("rejects an SR-IOV GPU VF with an invalid physfn entry", func() {
+			Expect(os.Mkdir(filepath.Join(pciDevicesPath, gpuID), 0755)).To(Succeed())
+			gpuVFPath := filepath.Join(pciDevicesPath, gpuVFID)
+			Expect(os.Mkdir(gpuVFPath, 0755)).To(Succeed())
+			Expect(os.WriteFile(filepath.Join(gpuVFPath, "physfn"), nil, 0644)).To(Succeed())
+
+			target := filepath.Join(sysDevicesPath, gpuID, gpuVFID, vgpuID)
+			Expect(os.MkdirAll(target, 0755)).To(Succeed())
+			Expect(os.Symlink(target, filepath.Join(mdevDevicesPath, vgpuID))).To(Succeed())
+
+			actualGPU, err := readGpuIDForVgpuFunc(pciDevicesPath, mdevDevicesPath, vgpuID)
+			Expect(err).To(MatchError(ContainSubstring("failed to read link for physical function")))
+			Expect(actualGPU).To(BeEmpty())
+		})
 	})
 
 	Context("createIommuDeviceMap() Tests", func() {
@@ -284,7 +360,7 @@ var _ = Describe("Device Plugin", func() {
 
 			workDir, err = os.MkdirTemp("", "kubevirt-test")
 			Expect(err).ToNot(HaveOccurred())
-			basePath = workDir
+			pciBasePath = workDir
 			os.Mkdir(filepath.Join(linkDir, deviceAddress1), 0755)
 			os.Mkdir(filepath.Join(linkDir, deviceAddress2), 0755)
 			os.Mkdir(filepath.Join(linkDir, deviceAddress3), 0755)
@@ -331,7 +407,7 @@ var _ = Describe("Device Plugin", func() {
 			workDir, err = os.MkdirTemp("", "kubevirt-test")
 			Expect(err).ToNot(HaveOccurred())
 			vGpuBasePath = workDir
-			basePath = workDir
+			pciBasePath = workDir
 			err = os.Mkdir(filepath.Join(workDir, "GpuId"), 0755)
 			Expect(err).ToNot(HaveOccurred())
 			err = os.WriteFile(filepath.Join(workDir, "GpuId", "numa_node"), []byte("2\n"), 0644)
@@ -352,7 +428,7 @@ var _ = Describe("Device Plugin", func() {
 
 		It("", func() {
 			readVgpuIDFromFile = getFakeVgpuIDFromFile
-			readGpuIDForVgpu = getFakeGpuIDforVpu
+			readGpuIDForVgpu = getFakeGpuIDforVgpu
 			startVgpuDevicePlugin = fakeStartVgpuDevicePluginFunc
 
 			createVgpuIDMap()

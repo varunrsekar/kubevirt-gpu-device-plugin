@@ -30,7 +30,9 @@ package device_plugin
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -67,7 +69,7 @@ var vGpuMap map[string][]NvidiaGpuDevice
 // Key is the Nvidia GPU id and value is the list of associated vGPU ids
 var gpuVgpuMap map[string][]string
 
-var basePath = "/sys/bus/pci/devices"
+var pciBasePath = "/sys/bus/pci/devices"
 
 // rootPath can be set for testing to simplify testing
 var rootPath = "/"
@@ -189,7 +191,7 @@ func createIommuDeviceMap() {
 	deviceMap = make(map[string][]NvidiaGpuDevice)
 	bdfToIommuMap = make(map[string]string)
 	//Walk directory to discover pci devices
-	filepath.Walk(basePath, func(path string, info os.FileInfo, err error) error {
+	filepath.Walk(pciBasePath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			log.Printf("Error accessing file path %q: %v\n", path, err)
 			return err
@@ -199,7 +201,7 @@ func createIommuDeviceMap() {
 			return nil
 		}
 		//Retrieve vendor for the device
-		vendorID, err := readIDFromFile(basePath, info.Name(), "vendor")
+		vendorID, err := readIDFromFile(pciBasePath, info.Name(), "vendor")
 		if err != nil {
 			log.Println("Could not get vendor ID for device ", info.Name())
 			return nil
@@ -209,7 +211,7 @@ func createIommuDeviceMap() {
 		if vendorID == nvidiaVendorID {
 			log.Println("Nvidia device ", info.Name())
 			//Retrieve iommu group for the device
-			driver, err := readLink(basePath, info.Name(), "driver")
+			driver, err := readLink(pciBasePath, info.Name(), "driver")
 			if err != nil {
 				log.Println("Could not get driver for device ", info.Name())
 				return nil
@@ -218,12 +220,12 @@ func createIommuDeviceMap() {
 				log.Printf("Skipping %s: driver %s is not a supported VFIO driver", info.Name(), driver)
 				return nil
 			}
-			iommuGroup, err := readLink(basePath, info.Name(), "iommu_group")
+			iommuGroup, err := readLink(pciBasePath, info.Name(), "iommu_group")
 			if err != nil {
 				log.Println("Could not get IOMMU Group for device ", info.Name())
 				return nil
 			}
-			numaNode, err := readNUMANode(basePath, info.Name())
+			numaNode, err := readNUMANode(pciBasePath, info.Name())
 			if err != nil {
 				log.Printf("Could not get NUMA node for device %s: %v. Defaulting to NUMA node 0", info.Name(), err)
 				numaNode = 0
@@ -231,7 +233,7 @@ func createIommuDeviceMap() {
 			log.Println("Iommu Group " + iommuGroup)
 			// Always record this PCI device (BDF) under its device ID so we
 			// advertise actual PCI BDFs to kubelet and provide NUMA topology.
-			deviceID, err := readIDFromFile(basePath, info.Name(), "device")
+			deviceID, err := readIDFromFile(pciBasePath, info.Name(), "device")
 			if err != nil {
 				log.Println("Could get deviceID for PCI address ", info.Name())
 				return nil
@@ -272,12 +274,12 @@ func createVgpuIDMap() {
 			return nil
 		}
 		//Retrieve the gpu ID for this vGPU
-		gpuID, err := readGpuIDForVgpu(vGpuBasePath, info.Name())
+		gpuID, err := readGpuIDForVgpu(pciBasePath, vGpuBasePath, info.Name())
 		if err != nil {
 			log.Println("Could not get vGPU type identifier for device ", info.Name())
 			return nil
 		}
-		numaNode, err := readNUMANode(basePath, gpuID)
+		numaNode, err := readNUMANode(pciBasePath, gpuID)
 		if err != nil {
 			log.Printf("Could not get NUMA node for GPU %s: %v. Defaulting to NUMA node 0", gpuID, err)
 			numaNode = 0
@@ -344,16 +346,59 @@ func readVgpuIDFromFileFunc(basePath string, deviceAddress string, property stri
 }
 
 // Read GPU id for a specific vGPU
-func readGpuIDForVgpuFunc(basePath string, deviceAddress string) (string, error) {
-	path, err := os.Readlink(filepath.Join(basePath, deviceAddress))
+//
+// For Non-SRIOV vGPU:
+//
+//	vgpu: /sys/bus/mdev/devices/<mdev-id> ->
+//	../../../devices/<pcie-root>/<intermediate-root>/<gpu-bdf>/<mdev-id>
+//
+// SRIOV vGPU:
+//
+//	vgpu: /sys/bus/mdev/devices/<mdev-id> ->
+//	../../../devices/<pcie-root>/<intermediate-root>/<gpu-bdf>/<gpu-vf-bdf>/<mdev-id>
+func readGpuIDForVgpuFunc(pciDevicesPath string, mdevDevicesPath string, deviceAddress string) (string, error) {
+	path, err := os.Readlink(filepath.Join(mdevDevicesPath, deviceAddress))
 	if err != nil {
-		klog.Errorf("Could not read link for device %s: %s", deviceAddress, err)
+		klog.Errorf("Could not read link for device %q: %v", deviceAddress, err)
 		return "", err
 	}
-	splitStr := strings.Split(path, "/")
-	length := len(splitStr)
-	return strings.Trim(splitStr[length-2], "\n"), nil
 
+	// symlink path should point to vgpu directory in GPU VF sysfs path.
+	vgpuIDDir, vgpuID := filepath.Split(path)
+	if vgpuIDDir == "" {
+		return "", fmt.Errorf("vgpu device %q symlink cannot be in the same directory", deviceAddress)
+	}
+	if vgpuID != deviceAddress {
+		return "", fmt.Errorf("vgpu device path symlink target %q does not match the device address %q", vgpuID, deviceAddress)
+	}
+
+	// Extract GPU ID / GPU VF ID from vGPU device path.
+	gpuVFIDDir, gpuVFID := filepath.Split(filepath.Clean(vgpuIDDir))
+	if gpuVFIDDir == "" {
+		return "", fmt.Errorf("vgpu device %q is not symlinked to a valid GPU VF sysfs path", deviceAddress)
+	}
+	gpuVFSysfsPath := filepath.Join(pciDevicesPath, gpuVFID)
+	if _, err := os.Stat(gpuVFSysfsPath); err != nil {
+		return "", fmt.Errorf("failed to verify sysfs path for GPU VF device %q: %w", gpuVFID, err)
+	}
+	gpuSysfsPath := filepath.Join(gpuVFSysfsPath, "physfn")
+	if _, err := os.Stat(gpuSysfsPath); err != nil {
+		// If vgpu is directly symlinked to GPU, the device path will not
+		// have a physfn symlink.
+		if errors.Is(err, fs.ErrNotExist) {
+			return filepath.Base(gpuVFSysfsPath), nil
+		}
+
+		return "", err
+	}
+
+	// If we reached here, its because the vgpu is symlinked to a GPU VF.
+	// Return the GPU ID from the VF's physfn symlink.
+	gpuSysfsPath, err = os.Readlink(gpuSysfsPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read link for physical function of GPU sysfs path %q: %w", gpuSysfsPath, err)
+	}
+	return filepath.Base(gpuSysfsPath), nil
 }
 
 func getIommuMap() map[string][]NvidiaGpuDevice {
